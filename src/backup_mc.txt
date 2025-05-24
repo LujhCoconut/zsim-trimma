@@ -1,0 +1,354 @@
+/**
+ * @brief 解耦出来专门为unison cache服务; 
+ * 		  Unison Cache是借鉴了Alloy Cache 和Footprint Cache，将标签元数据直接嵌入堆叠DRAM以实现任意容量的扩展，
+ * 		  采用大尺寸页级缓存分配单元以提高命中率并降低标签开销，通过预测和选择性获取页内有效块来最小化片外流量。
+ * @author Jiahao Lu
+ * @cite Unison Cache: A Scalable and Effective Die-Stacked DRAM Cache (MICRO'14)
+ * @attention 假设单个tag的大小为4B,access函数的第3个参数，每单位“1”代表16B，因此需要区分；这里统计与访问分离！
+ * 			  目前其实LRU相联度高的时候的开销是没有考虑的，但实际上这也是一个问题，单次其实还好，但出现多了也是很大的开销。
+ * @bug GM_Memalign to be fixed (initial version can run)
+ * 		排查点（1）引入了四个 Counter 导致的问题？ 【正在确认...】
+ * 		排查点（2）DDRMemory 引入第四个参数的access函数，是否设置过大，使得事件队列溢出？ 【未确认...】
+ */
+uint64_t
+MemoryController::unison_cache_access(MemReq& req)
+{
+	// MESI State
+	switch (req.type)
+	{
+	case PUTS:
+	case PUTX:
+		*req.state = I;
+		break;
+	case GETS:
+		*req.state = req.is(MemReq::NOEXCL) ? S : E;
+		break;
+	case GETX:
+		*req.state = M;
+		break;
+	default:
+		panic("!?");
+	}
+
+	// 这里需不需要考虑取标签比较呢？  这个需要仔细考虑
+	if (req.type == PUTS)
+		return req.cycle;
+
+	futex_lock(&_lock);
+
+	if (_collect_trace && _name == "mem-0")
+	{
+		_address_trace[_cur_trace_len] = req.lineAddr;
+		_type_trace[_cur_trace_len] = (req.type == PUTX) ? 1 : 0;
+		_cur_trace_len++;
+		assert(_cur_trace_len <= _max_trace_len);
+		if (_cur_trace_len == _max_trace_len)
+		{
+			FILE *f = fopen((_trace_dir + _name + g_string("trace.txt")).c_str(), "a"); // 使用 "a" 以追加模式打开文件
+			for (size_t i = 0; i < _max_trace_len; i++)
+			{
+				fprintf(f, "%lu, %lx, %u\n", _cycle_trace[i], _address_trace[i], _type_trace[i]);
+			}
+			fclose(f);
+			_cur_trace_len = 0;
+		}
+	}
+
+	// 请求数
+	_num_requests ++;
+
+	ReqType type = (req.type == GETS || req.type == GETX) ? LOAD : STORE;
+	Address address = req.lineAddr;
+	 // 再次强调，此处代码`mcdram`指代的是off-chip DDR,而非本意HBM；我们考虑的系统是DDR + CXL_Memory Tiered Memory
+	uint32_t mcdram_select = (address / 64) % _mcdram_per_mc;
+	Address mc_address = (address / 64 / _mcdram_per_mc * 64) | (address % 64); 
+	Address tag = address / (_granularity / 64);
+	// 参数`_num_sets` 取决于 参数 `_cache_size`
+	uint64_t set_num = tag % _num_sets;
+	uint32_t hit_way = _num_ways;
+	uint64_t data_ready_cycle = req.cycle;
+	MESIState state;
+
+	// 这行代码的意思看不太懂
+	uint64_t step_length = _cache_size / 64 / 10;
+	// bool hybrid_tag_probe = false;
+	// if (_granularity >= 4096) {} // 实际上，这个代码可能不需
+
+	// 检查当前请求的 tag 是否存在于 TLB 中
+	// 疑问：这个tlb是否与我们熟知的TLB是一致的？
+	// bool tlb_miss = false; // added by jiahao
+	if(_tlb.find(tag) == _tlb.end())
+	{
+		_tlb[tag] = TLBEntry{tag,_num_ways,0,0,0};
+		// tlb_miss = true;
+	}
+	
+	if(_tlb[tag].way != _num_ways)
+	{
+		hit_way = _tlb[tag].way;
+		assert(_cache[set_num].ways[hit_way].valid && _cache[set_num].ways[hit_way].tag == tag);
+	}
+	else if (_scheme != Tagless)
+	{
+			// for Tagless, this assertion takes too much time.
+		for (uint32_t i = 0; i < _num_ways; i++)
+			assert(_cache[set_num].ways[i].tag != tag || !_cache[set_num].ways[i].valid);
+	}
+
+	assert(_scheme == UnisonCache);
+
+	// 这里与原来的代码存在差异，原版本的代码在这里以一次访问取得tag和data
+	// 尽管在取数据层面上，Unison Cache与AlloyCache 以一个cacheline粒度同时取tag和data1
+	// 但tag匹配上，仍然是需要取一个set里的所有tags
+	// 目前考虑如下:TLB Miss情况下,才需要取所有tags进行比较，这部分的时间如何考虑？？
+	// if(tlb_miss)invalid_data_size.inc(_num_ways*4); //参见@attention 统计与访问分离，路数 X 4B // datasize upd
+
+	// 在这里，是和Alloy Cache的TAD一样，如果Miss了，tag和data都是无效数据，这里稍后进行统计
+	if (type == LOAD)
+	{
+		req.lineAddr = mc_address; // transMCAddressPage(set_num, 0); //mc_address;
+		req.cycle = _mcdram[mcdram_select]->access(req, 0, 6, false); // 此处数据不存在CXL-Memory上，禁用cxl_support
+		_mc_bw_per_step += 6;
+		_numTagLoad.inc();
+		req.lineAddr = address; 
+	}
+	else
+	{
+		assert(type == STORE);
+		MemReq tag_probe = {mc_address, GETS, req.childId, &state, req.cycle, req.childLock, req.initialState, req.srcId, req.flags};
+		req.cycle = _mcdram[mcdram_select]->access(tag_probe, 0, 2, false); // 此处数据不存在CXL-Memory上，禁用cxl_support
+		_mc_bw_per_step += 2;
+		_numTagLoad.inc();
+	}
+
+	bool cache_hit = hit_way != _num_ways;
+	bool counter_access = false;
+
+	if (!cache_hit)
+	{
+		// cache未命中，刚刚取的tag和data全部都是无效数据（共计4B+64B）
+		// invalid_data_size.inc(4+64); // datasize upd
+
+		uint64_t cur_cycle = req.cycle;
+		_num_miss_per_step++;
+		if (type == LOAD)
+			_numLoadMiss.inc();
+		else
+			_numStoreMiss.inc();
+		// _numTotalMiss.inc(); // hitmiss upd
+
+		uint32_t replace_way = _num_ways;
+		if (set_num >= _ds_index)
+		{	// RepScheme 0:LRU 1:FBR
+			replace_way = _page_placement_policy->handleCacheMiss(tag, type, set_num, &_cache[set_num], counter_access);
+		}
+
+		if(type == LOAD)
+		{
+			req.cycle = _cxl_memory->access(req, 1, 4, cxl_support);
+			_ext_bw_per_step += 4;
+		}
+		else if(type == STORE && replace_way >= _num_ways)
+		{
+			req.cycle = _cxl_memory->access(req, 1, 4, false); // 此处数据不写在CXL-Memory上，禁用cxl_support
+			_ext_bw_per_step += 4;
+		}
+		data_ready_cycle = req.cycle;
+
+		// 当前访问cacheline为有效数据
+		// valid_data_size.inc(64); // datasize upd
+
+		if (replace_way < _num_ways) // 有替换的
+		{
+			// uint32_t access_size = _granularity / 64;
+			uint32_t access_size = (_scheme == UnisonCache || _scheme == Tagless) ? _footprint_size : (_granularity / 64);
+			// load page from ext dram (CXL-Memory)
+			MemReq load_req = {tag * 64, GETS, req.childId, &state, req.cycle, req.childLock, req.initialState, req.srcId, req.flags};
+			_cxl_memory->access(load_req, 2, access_size * 4 , cxl_support);
+			_ext_bw_per_step += access_size * 4;
+			// store the page to mcdram
+			MemReq insert_req = {mc_address, PUTX, req.childId, &state, req.cycle, req.childLock, req.initialState, req.srcId, req.flags};
+			_mcdram[mcdram_select]->access(insert_req, 2, access_size * 4, false); // 此处数据不写在CXL-Memory上，禁用cxl_support
+			_mc_bw_per_step += access_size * 4;
+			if(!_sram_tag)
+			{
+				_mcdram[mcdram_select]->access(insert_req, 2, 2 , false); // store tag
+				_mc_bw_per_step += 2;				
+				// store tag 本质也是无效数据
+				// invalid_data_size.inc(4); // datasize upd
+			}
+			_numTagStore.inc();
+			_numPlacement.inc();
+
+			// 没那么好认定到底是有效还是无效，因此此处定义为`migrate_data_size`
+			// migrate_data_size.inc(4096-64); // datasize upd
+
+			if (_cache[set_num].ways[replace_way].valid) // 页粒度迁移, 脏行精确回写​​,以节省带宽
+			{
+				Address replaced_tag = _cache[set_num].ways[replace_way].tag;
+				_tlb[replaced_tag].way = _num_ways;
+				uint32_t unison_dirty_lines = __builtin_popcountll(_tlb[replaced_tag].dirty_bitvec) * 4;
+				uint32_t unison_touch_lines = __builtin_popcountll(_tlb[replaced_tag].touch_bitvec) * 4;
+				assert(unison_touch_lines > 0 && unison_touch_lines <= 64 && unison_dirty_lines <= 64);
+				_numTouchedLines.inc(unison_touch_lines);
+				_numEvictedLines.inc(unison_dirty_lines);
+
+				if (_cache[set_num].ways[replace_way].dirty)
+				{
+					_numDirtyEviction.inc();
+					assert(unison_dirty_lines > 0);
+					assert(unison_dirty_lines <= 64);
+
+					// load page from mcdram
+					MemReq load_req = {mc_address, GETS, req.childId, &state, cur_cycle, req.childLock, req.initialState, req.srcId, req.flags};
+					_mcdram[mcdram_select]->access(load_req, 2, unison_dirty_lines * 4, cxl_support);
+					_mc_bw_per_step += unison_dirty_lines * 4;
+					// store page to ext dram (future cxl-memory)
+					MemReq wb_req = {_cache[set_num].ways[replace_way].tag * 64, PUTX, req.childId, &state, cur_cycle, req.childLock, req.initialState, req.srcId, req.flags};
+					_cxl_memory->access(wb_req, 2, unison_dirty_lines * 4, false);
+					_ext_bw_per_step += unison_dirty_lines * 4;
+
+					// 归属于migrate
+					// migrate_data_size.inc(unison_dirty_lines*64); //datasize upd
+				}
+				else
+				{
+					_numCleanEviction.inc();
+					assert(unison_dirty_lines == 0);
+				}
+			}
+			_cache[set_num].ways[replace_way].valid = true;
+			_cache[set_num].ways[replace_way].tag = tag;
+			_cache[set_num].ways[replace_way].dirty = (req.type == PUTX);
+			_tlb[tag].way = replace_way;
+
+			uint64_t bit = (address - tag * 64) / 4;
+			assert(bit < 16 && bit >= 0);
+			bit = ((uint64_t)1UL) << bit;
+			_tlb[tag].touch_bitvec = 0;
+			_tlb[tag].dirty_bitvec = 0;
+			_tlb[tag].touch_bitvec |= bit;
+			if (type == STORE)
+					_tlb[tag].dirty_bitvec |= bit;
+		}
+		else
+		{
+			// Miss but no replacement 
+			assert(false); // 没有指定策略的话是不合法的状态
+		}
+	}
+	else // cache hit
+	{
+		// _numTotalHit.inc(); // hitmiss upd
+		// invalid_data_size.inc(4); // datasize upd 无论如何也是读了一个tag
+		assert(set_num >= _ds_index);
+		// LLC dirty eviction hit
+		if(type == STORE)
+		{
+			MemReq write_req = {mc_address, PUTX, req.childId, &state, req.cycle, req.childLock, req.initialState, req.srcId, req.flags};
+			req.cycle = _mcdram[mcdram_select]->access(write_req, 1, 4, false);
+			_mc_bw_per_step += 4;
+		}
+		
+		data_ready_cycle = req.cycle;
+		_num_hit_per_step++;
+		_page_placement_policy->handleCacheHit(tag, type, set_num, &_cache[set_num], counter_access, hit_way);
+		// valid_data_size.inc(64); // datasize upd
+
+		if (req.type == PUTX)
+		{
+			_numStoreHit.inc();
+			_cache[set_num].ways[hit_way].dirty = true;
+		}
+		else
+			_numLoadHit.inc();
+		// _numTotalHit.inc(); // 上面已经写了
+
+		// Update LRU information for UnisonCache
+		MemReq tag_update_req = {mc_address, PUTX, req.childId, &state, req.cycle, req.childLock, req.initialState, req.srcId, req.flags};
+		_mcdram[mcdram_select]->access(tag_update_req, 2, 2, false);
+		_mc_bw_per_step += 2;
+		_numTagStore.inc();
+		uint64_t bit = (address - tag * 64) / 4;
+		assert(bit < 16 && bit >= 0);
+		bit = ((uint64_t)1UL) << bit;
+		_tlb[tag].touch_bitvec |= bit;
+		if (type == STORE)
+				_tlb[tag].dirty_bitvec |= bit;
+		
+		// policy_update_size.inc(4); // datasize upd
+	}
+
+	if(counter_access && !_sram_tag)
+	{
+		assert(set_num >= _ds_index);
+		_numCounterAccess.inc();
+		MemReq counter_req = {mc_address, GETS, req.childId, &state, req.cycle, req.childLock, req.initialState, req.srcId, req.flags};
+		_mcdram[mcdram_select]->access(counter_req, 2, 2, false);
+		counter_req.type = PUTX;
+		_mcdram[mcdram_select]->access(counter_req, 2, 2, false);
+		_mc_bw_per_step += 4;
+	}
+
+	if (_num_requests % step_length == 0)
+	{
+		_num_hit_per_step /= 2;
+		_num_miss_per_step /= 2;
+		_mc_bw_per_step /= 2;
+		_ext_bw_per_step /= 2;
+		//默认不开启
+		if (_bw_balance && _mc_bw_per_step + _ext_bw_per_step > 0)
+		{
+			double ratio = 1.0 * _mc_bw_per_step / (_mc_bw_per_step + _ext_bw_per_step);
+			double target_ratio = 0.8; // because mc_bw = 4 * ext_bw
+			uint64_t index_step = _num_sets / 1000; // in terms of the number of sets
+			int64_t delta_index = (ratio - target_ratio > -0.02 && ratio - target_ratio < 0.02) ? 0 : index_step * (ratio - target_ratio) / 0.01;
+			if (delta_index > 0)
+			{
+				for (uint32_t mc = 0; mc < _mcdram_per_mc; mc++)
+				{
+					for (uint64_t set = _ds_index; set < (uint64_t)(_ds_index + delta_index); set++)
+					{
+						if (set >= _num_sets)
+							break;
+						for (uint32_t way = 0; way < _num_ways; way++)
+						{
+							Way &meta = _cache[set].ways[way];
+							if (meta.valid && meta.dirty)
+							{
+								// should write back to external dram.
+								MemReq load_req = {meta.tag * 64, GETS, req.childId, &state, req.cycle, req.childLock, req.initialState, req.srcId, req.flags};
+								_mcdram[mc]->access(load_req, 2, (_granularity / 64) * 4 , false);
+								MemReq wb_req = {meta.tag * 64, GETS, req.childId, &state, req.cycle, req.childLock, req.initialState, req.srcId, req.flags};
+								_cxl_memory->access(wb_req, 2, (_granularity / 64) * 4, cxl_support);
+								_ext_bw_per_step += (_granularity / 64) * 4;
+								_mc_bw_per_step += (_granularity / 64) * 4;
+							}
+							if (_scheme == HybridCache && meta.valid)
+							{
+								_tlb[meta.tag].way = _num_ways;
+								// for Hybrid cache, should insert to tag buffer as well.
+								if (!_tag_buffer->canInsert(meta.tag))
+								{
+									printf("Rebalance. [Tag Buffer FLUSH] occupancy = %f\n", _tag_buffer->getOccupancy());
+									_tag_buffer->clearTagBuffer();
+									_tag_buffer->setClearTime(req.cycle);
+									_numTagBufferFlush.inc();
+								}
+								assert(_tag_buffer->canInsert(meta.tag));
+								_tag_buffer->insert(meta.tag, true);
+							}
+							meta.valid = false;
+							meta.dirty = false;
+						}
+						if (_scheme == HybridCache)
+							_page_placement_policy->flushChunk(set);
+					}
+				}
+			}
+			_ds_index = ((int64_t)_ds_index + delta_index <= 0) ? 0 : _ds_index + delta_index;
+		}
+	}
+	futex_unlock(&_lock);
+	return data_ready_cycle;
+}

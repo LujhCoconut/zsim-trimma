@@ -1,0 +1,7 @@
+*.log
+/build/
+*.h5
+*.out
+artifact_evaluation/configs/auto_made_cfg/*
+artifact_evaluation/configs/log/*
+artifact_evaluation/output/*
