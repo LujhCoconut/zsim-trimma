@@ -42,136 +42,33 @@ using DeviceAddr = Address;
 using BlockID = uint32_t;
 using BitVector = uint32_t;
 
-/**
- * @brief iRT 为不同的集合（set）使用独立的树结构;
- * 		  Trimma核心数据结构，Radix Tree (per set); ​Radix核心理念​​：将键值按比特位分割，逐层映射到树节点；
- * 		  Trimma 使用 11 位 tag chunk 来构建一个 2048 叉的 radix tree；
- * 		  一个简单的两级 iRT 结构就足以支持多数情况，进一步增加层级并不能带来更多空间节省
- * @author Jiahao Lu @ XMU
- * @attention 对于一个PA，其索引位首先选择该地址所在集合的 tag 根节点; tag_roots_
- * 			  该根节点指向对应的多级重映射表的根 //
- * 			  PA中的 tag 位被划分为多个部分，用于逐级遍历重映射表，直到定位到叶子节点，
- * 			  该节点存储重映射后的block ID，再与block offset拼接生成最终的DA。
- * 
- * 			  > iRT查找失败，则DA==PA （未被cache/migrate或未allocate）		  
- */
-class iRT
-{
-public:
-	struct iRNode{
-		bool is_leaf;
-		union{
-			BitVector* allocated_bits; // 中间节点仅使用2048位向量（bit vector）来表示下一层是否已分配
-			BlockID remapped_id; // 仅叶子节点存储重映射块 ID
-		};
-	};
-
-	static constexpr uint32_t BITS_PER_LEVEL = 11;   // 每层11位
-	static constexpr uint32_t CHILDREN_PER_NODE = 1 << BITS_PER_LEVEL; // 2048
-	static constexpr uint32_t LEVELS = 2;             // 两级结构
-
-	// 48位地址
-	struct AddrLayout {
-        static constexpr uint32_t SET_BITS = 11;      // 2048 sets
-        static constexpr uint32_t TAG_BITS = BITS_PER_LEVEL * LEVELS; // 22位
-        static constexpr uint32_t OFFSET_BITS = 12;   // 4KB块偏移
-        static_assert(SET_BITS + TAG_BITS + OFFSET_BITS <= 48, "Address overflow");
-        
-        // 地址解码
-        static uint32_t set(PhysicalAddr pa) { 
-            return (pa >> (TAG_BITS + OFFSET_BITS)) & ((1 << SET_BITS)-1); 
-        }
-        static uint32_t tag(PhysicalAddr pa, int level) {
-            return (pa >> (OFFSET_BITS + (LEVELS-level-1)*BITS_PER_LEVEL)) 
-                   & ((1 << BITS_PER_LEVEL)-1);
-        }
-    };
-
-	g_vector<iRNode> node_pool_;
-	g_vector<uint32_t> tag_roots_; // 根节点索引
-	static constexpr uint32_t INVALID_INDEX = ~0u;
-
- 	iRT(int sets) : tag_roots_(sets, INVALID_INDEX) {
-        // 预分配根节点（每个set一个）
-        for(auto& root : tag_roots_) {
-            root = allocate_node(false); // 中间节点
-        }
-    }
-
-	/**
-	 * @brief 根据物理地址进行多级查找。首先提取set_index，如果超出范围则返回恒等映射。
-	 * 		  然后获取根节点的current_idx，如果是无效的，直接返回。
-	 * 		  然后循环遍历LEVEL_SIZES的层级数减一，因为最后一级是叶节点。
-	 * 		  在每个层级，检查节点是否是叶节点（可能提前终止循环），然后提取当前层级的slot。
-	 * 		  检查该slot是否已经分配，如果没有，返回恒等映射;
-	 * 		  否则计算子节点索引并继续查找。最后处理叶节点，合成设备地址。
-	 * @example pa=0x12345678： 
-	 * 		【假设如下】
-	 * 			| 11-bit Set | 5-bit Level0 | 5-bit Level1 | 8-bit Block Offset |
-	 * 			| (0x3FF)    | (0x1F)       | (0x1F)       | (0xFF)             |
-	 * 			 0001 0010 0011 0100 0101 0110 0111 1000
-	 * 			| 0001 0010 001 | 1 0100 | 0 1011 | ... | 0111 1000 |
-	 * 		【提取流程】
-	 * 			set_idx = 0001 0010 001 → 0x113
-	 * 			→ tag_roots_[0x113]
-	 * 			Level-0:1 0100 → 0x14
-	 * 			Level-1:0 1011 → 0x0B
-	 * 
-	 */
-	DeviceAddr translate(PhysicalAddr pa) const {
-        const uint32_t set_idx = AddrLayout::set(pa);
-        if(set_idx >= tag_roots_.size()) return pa;
-        
-        uint32_t current_idx = tag_roots_[set_idx];
-        for(uint32_t level = 0; level < LEVELS-1; ++level) { // 仅遍历中间层
-            if(current_idx >= node_pool_.size())return pa; // 越界保护
-			const auto& node = node_pool_[current_idx];
-            if(node.is_leaf) break; // 提前终止
-            
-            const uint32_t slot = AddrLayout::tag(pa, level);
-            if(!check_bit(node.allocated_bits, slot)) 
-                return pa;
-                
-            current_idx = node.allocated_bits[slot / 32] >> (slot % 32); // 简化版子节点索引
-        }
-        
-        // 叶子节点处理
-        const auto& leaf = node_pool_[current_idx];
-        return leaf.is_leaf ? 
-            (leaf.remapped_id << AddrLayout::OFFSET_BITS) | (pa & ((1<<AddrLayout::OFFSET_BITS)-1)) 
-            : pa;
-    }
-
-private:
-    // 位操作辅助函数
-    bool check_bit(uint32_t* bits, uint32_t pos) const {
-        return (bits[pos/32] >> (pos%32)) & 0x1;
-    }
-    
-    /**
-	 * @brief 节点分配
-	 * @todo 处理内存对齐 ?
-	 */
-    uint32_t allocate_node(bool is_leaf) {
-        const uint32_t idx = node_pool_.size();
-        iRNode node;
-        node.is_leaf = is_leaf;
-        if(!is_leaf) {
-            node.allocated_bits = new uint32_t[CHILDREN_PER_NODE/32](); // 64x32-bit
-        }
-        node_pool_.push_back(node);
-        return idx;
-    }
-};
-
+static constexpr uint32_t BITS_PER_LEVEL = 11;    // 每层11位
+static constexpr uint32_t CHILDREN_PER_NODE = 1 << BITS_PER_LEVEL; // 2048
+static constexpr uint32_t LEVELS = 2;             // 两级结构
+static constexpr uint32_t INVALID_INDEX = ~0u;
 
 /**
  * 使用多级表结构的一个主要问题是查找延迟增加。
  * 一个具有 𝐿 级的重映射表在最坏情况下可能引入最多 𝐿 + 1 次的片外访问。
  * 就像操作系统页表依赖 TLB 来加速访问一样，重映射表也需要更高效的缓存机制。
- * 
- * 
  */
+
+/**
+ * @brief NonIdCache查询结果：命中状态和设备地址
+ */
+struct NonIdLookupResult {
+    bool hit;
+    DeviceAddr dev_addr;
+};
+
+/**
+ * @brief IdCache查询结果
+ */
+struct IdLookupResult {
+    bool hit;          // 是否在IdCache中命中
+    bool is_identity;  // 是否为恒等映射（仅当hit=true时有效）
+};
+
 
 /**
  * @brief NonIdCache条目：非身份映射的设备地址
@@ -206,23 +103,21 @@ public:
 
 	NonIdCache() : sets(2048){}
 
-	bool lookup(PhysicalAddr pa, DeviceAddr& da)
-	{
-		uint32_t set_idx = (pa >> 6) & 0x7FF; // 暂定11位索引，后续再改
-		uint32_t tag = pa >> 17; // 剩余位作为tag
+	NonIdLookupResult lookup(PhysicalAddr pa) 
+	{  // 参数列表仅含pa
+        uint32_t set_idx = (pa >> 8) & 0x7FF;
+        uint32_t tag = pa >> 19;
 
-		NonIdCacheSet& target_set = sets[set_idx];
-		for (int i = 0; i < 6; ++i) {
+        NonIdCacheSet& target_set = sets[set_idx];
+        for (int i = 0; i < 6; ++i) {
             if (target_set.ways[i].valid && 
                 target_set.ways[i].phy_tag == tag) {
-                // 更新LRU信息
                 update_lru(target_set.lru_value, i);
-                da = target_set.ways[i].dev_addr;
-                return true;
+                return {true, target_set.ways[i].dev_addr}; // 返回结构体
             }
         }
-        return false;
- 	}
+        return {false, 0}; // 未命中时返回默认值
+    }
 
 	void insert(PhysicalAddr pa, DeviceAddr da)
 	{
@@ -254,6 +149,20 @@ public:
         }
         return max_idx;
     }
+
+	void invalidate(PhysicalAddr pa) 
+	{
+        uint32_t set_idx = (pa >> 8) & 0x7FF;
+        uint32_t tag = pa >> 19;
+        
+        auto& set = sets[set_idx];
+        for (auto& entry : set.ways) {
+            if (entry.valid && entry.phy_tag == tag) {
+                entry.valid = false; // 简单标记失效
+                break;
+            }
+        }
+    }
 };
 
 /**
@@ -284,33 +193,81 @@ public:
 
 	IdCache() : sets(256){}
 
-	bool lookup(PhysicalAddr pa, uint32_t& out_bitmap)
-	{
-		uint32_t super_tag = pa >> 7; // 8KB
-		uint32_t set_idx = hash_function(super_tag) & 255;
+ 	IdLookupResult lookup(PhysicalAddr pa) {
+    // 计算超级块标签和块索引
+    const uint32_t kSuperBlockSize = 8192; // 8KB
+    const uint32_t kBlockSize = 256;       // 256B
+    const uint32_t kBlocksPerSuper = kSuperBlockSize / kBlockSize; // 32
 
-		IdCacheSet& target_set = sets[set_idx];
-		for (int i = 0; i < 16; ++i) {
-            if (target_set.ways[i].valid && 
-                target_set.ways[i].super_tag == super_tag) {
-                out_bitmap = target_set.ways[i].bitmap;
-                target_set.access_time[i] = ++timestamp; // 更新访问时间
-                return true;
+    //计算超级块标签和块索引
+    uint32_t super_tag = pa >> 13;         // 8KB对齐，低13位为块内偏移
+    uint32_t block_index = (pa >> 8) & 0x1F; // 提取[12:8]作为块索引（0-31）
+
+    //计算set索引
+    uint32_t set_idx = hash_function(super_tag) & 0xFF;
+
+    //查找匹配的条目
+    IdCacheSet& target_set = sets[set_idx];
+    for (int i = 0; i < 16; ++i) {
+        if (target_set.ways[i].valid && 
+            target_set.ways[i].super_tag == super_tag) {
+            // 4. 命中后更新访问时间
+            target_set.access_time[i] = ++timestamp;
+
+            // 5. 检查bitmap中对应bit位
+            uint32_t bitmap = target_set.ways[i].bitmap;
+            bool is_identity = (bitmap & (1 << block_index)) != 0;
+
+            return {true, is_identity}; // 返回具体是否恒等映射
+        }
+    }
+
+    return {false, false}; // 未命中
+}
+
+	void insert(PhysicalAddr pa) {
+        const uint32_t kSuperBlockSize = 8192;
+        const uint32_t block_idx = (pa % kSuperBlockSize) / 256; // 计算块索引
+        
+        uint32_t super_tag = pa / kSuperBlockSize;
+        uint32_t set_idx = hash_function(super_tag) % 256;
+        
+        // 查找或创建条目
+        auto& set = sets[set_idx];
+        int found = -1;
+        for (int i=0; i<16; ++i) {
+            if (set.ways[i].super_tag == super_tag) {
+                found = i;
+                break;
             }
         }
-		return false;
-	}
+        
+        if (found == -1) {
+            found = find_fifo_victim(set.access_time);
+            set.ways[found] = {super_tag, 0, true}; // 初始化新条目
+        }
+        
+        // 设置对应bit位
+        set.ways[found].bitmap |= (1 << block_idx);
+        set.access_time[found] = ++timestamp;
+    }
 
-	void insert(PhysicalAddr pa, uint32_t bitmap)
+	void invalidate(PhysicalAddr pa) 
 	{
-		uint32_t super_tag = pa >> 7; //8KB
-		uint32_t set_idx = hash_function(super_tag) % 256;
-
-		IdCacheSet& target_set = sets[set_idx];
-		int victim_way = find_fifo_victim(target_set.access_time);
-		target_set.ways[victim_way] = {super_tag, bitmap, true};
-		target_set.access_time[victim_way] = ++timestamp;
-	}
+        const uint32_t super_tag = pa >> 13;
+        const uint32_t block_idx = (pa >> 8) & 0x1F;
+        
+        uint32_t set_idx = hash_function(super_tag) & 0xFF;
+        auto& set = sets[set_idx];
+        
+        for (auto& entry : set.ways) {
+            if (entry.valid && entry.super_tag == super_tag) {
+                entry.bitmap &= ~(1 << block_idx); // 清除对应bit
+                if (entry.bitmap == 0) entry.valid = false;
+                break;
+            }
+        }
+    }
 
 	uint32_t hash_function(uint32_t key) {
         key = ((key >> 16) ^ key) * 0x45d9f3b;
@@ -338,205 +295,310 @@ public:
 
 
 /**
- * @brief 叶子节点，每个叶子节点挂4个way
+ * @brief iRT 为不同的集合（set）使用独立的树结构;
+ * 		  Trimma核心数据结构，Radix Tree (per set); ​Radix核心理念​​：将键值按比特位分割，逐层映射到树节点；
+ * 		  Trimma 使用 11 位 tag chunk 来构建一个 2048 叉的 radix tree；
+ * 		  一个简单的两级 iRT 结构就足以支持多数情况，进一步增加层级并不能带来更多空间节省
  * @author Jiahao Lu @ XMU
- * @attention 文章还没投出去，这段代码不可以开源
+ * @attention 对于一个PA，其索引位首先选择该地址所在集合的 tag 根节点; tag_roots_
+ * 			  该根节点指向对应的多级重映射表的根 //
+ * 			  PA中的 tag 位被划分为多个部分，用于逐级遍历重映射表，直到定位到叶子节点，
+ * 			  该节点存储重映射后的block ID，再与block offset拼接生成最终的DA。
+ * 			  > iRT查找失败，则DA==PA （未被cache/migrate或未allocate）		  
+ * 
+ * @todo Q1:set的数量？ fast memory大小 /（组相联度 * 256B）
  */
-class SDLNode
-{
+class iRT {
+public:
+    struct iRNode {
+        bool is_leaf;
+        union {
+            struct {
+                uint32_t allocated_bits[CHILDREN_PER_NODE/32]; // 64 x uint32_t
+                uint32_t child_indices[CHILDREN_PER_NODE];      // 2048 entries
+            };
+            BlockID remapped_id; // 叶子节点使用
+        };
+
+        iRNode(bool leaf = false) : is_leaf(leaf) {
+            if (!is_leaf) {
+                memset(allocated_bits, 0, sizeof(allocated_bits));
+                memset(child_indices, 0xFF, sizeof(child_indices)); // 初始化为无效
+            }
+        }
+    };
+
+    struct AddrLayout {
+        static constexpr uint32_t OFFSET_BITS = 8;    // 256B块偏移
+        static constexpr uint32_t LEVEL_BITS  = 11;   // 每级11位
+        static constexpr uint32_t SET_BITS    = 11;   // 2048个集合
+
+        static uint32_t set(PhysicalAddr pa) { 
+            return (pa >> (LEVEL_BITS*LEVELS + OFFSET_BITS)) & ((1<<SET_BITS)-1);
+        }
+        
+        static uint32_t tag(PhysicalAddr pa, int level) {
+            const uint32_t shift = OFFSET_BITS + (LEVELS-level-1)*LEVEL_BITS;
+            return (pa >> shift) & ((1 << LEVEL_BITS)-1);
+        }
+    };
+
 private:
-	int last_way = 0;
+    std::vector<iRNode> node_pool_;
+    std::vector<uint32_t> tag_roots_; // 每个集合的根节点索引
+
 public:
-	// store in 3D-Stacked SRAM
-	g_vector<bool> empty_array; // 指示4个way的empty情况
-	g_vector<uint64_t> c_tag; // 指示4个压缩后的tag
-	g_vector<uint32_t> rrpv_array; // 指示4个way的rrpv值
+    iRT(int sets) : tag_roots_(sets, INVALID_INDEX) {
+        // 预分配所有根节点（中间节点）
+        for (auto& root_idx : tag_roots_) {
+            root_idx = allocate_node(false); 
+        }
+    }
 
-	// store in DDR
-	g_vector<g_vector<bool>> dirty_vector;
-	g_vector<g_vector<bool>> valid_vector;
+    DeviceAddr translate(PhysicalAddr pa) const {
+        const uint32_t set_idx = AddrLayout::set(pa);
+        if (set_idx >= tag_roots_.size()) return pa;
 
+        uint32_t current_idx = tag_roots_[set_idx];
+        if (current_idx == INVALID_INDEX) return pa;
 
-	SDLNode()
-	{
-		empty_array.resize(4,true);
-		c_tag.resize(4,0);
-		rrpv_array.resize(4,3); // 按照3来初始化
-		dirty_vector.resize(4, g_vector<bool>(64, false)); 
-		valid_vector.resize(4, g_vector<bool>(64, false)); 
-	}
+        // 遍历中间层级
+        for (uint32_t level = 0; level < LEVELS; ++level) {
+            const auto& node = node_pool_[current_idx];
+            if (node.is_leaf) {
+                // 叶子节点：合成设备地址
+                return (node.remapped_id << AddrLayout::OFFSET_BITS) | 
+                       (pa & ((1 << AddrLayout::OFFSET_BITS)-1));
+            }
 
-	/**
-	 * @brief 更新RRPVs,保证至少有一个RRPV=3的；被动调用；主动aging待考虑
-	 */
-	void updRRPV()
-	{
-		bool hasRRPV = false;
-		while(!hasRRPV)
-		{
-			for(int i = 0 ;i < 4;i++)
-			{
-				if(rrpv_array[i]==3)
-				{
-					hasRRPV = true;
-					break;
-				}
-			}
-			if(!hasRRPV)
-			{
-				for(int i = 0 ;i < 4;i++)
-				{
-					rrpv_array[i] += 1;
-				}
-			}
-		}
-	}
+            const uint32_t slot = AddrLayout::tag(pa, level);
+            if (!check_bit(node.allocated_bits, slot)) return pa;
 
-	/**
-	 * @brief 根据RRPV选择淘汰/驱逐的way
-	 * @todo 优化victim_way的选择，拒绝从0开始遍历
-	 */
-	int findRRPVEvict()
-	{
-		int victim_way_idx = -1;
-		updRRPV(); // 保证有可以替换的
-		for(int i = 0; i < 4; i++)
-		{
-			last_way += 1;
-			if(last_way == 4)last_way = 0;
-			if(rrpv_array[last_way]==3)
-			{
-				victim_way_idx = last_way;
-				break;
-			}
-		}
-		assert(-1 != victim_way_idx);
-		return victim_way_idx;
-	}
+            current_idx = node.child_indices[slot];
+            if (current_idx == INVALID_INDEX) return pa;
+        }
+        return pa; // 理论上不可达
+    }
 
-	/**
-	 * @brief 根据way信息更新RRPV的值
-	 */
-	void resetRRPV(int way, uint32_t set_rrpv = 2)
-	{
-		rrpv_array[way] = set_rrpv;
-	}
+    void update(PhysicalAddr pa, DeviceAddr da) {
+		// 提取da的块ID（移除块内偏移）计算set_index
+        const BlockID remapped_block = da >> AddrLayout::OFFSET_BITS;
+        const uint32_t set_idx = AddrLayout::set(pa);
+        if (set_idx >= tag_roots_.size()) return;
+		// 获取当前集合的根节点索引
+        uint32_t current_idx = tag_roots_[set_idx];
+		// 逐层向下分配或更新节点
+        for (uint32_t level = 0; level < LEVELS; ++level) {
+            iRNode& node = node_pool_[current_idx];
+            const uint32_t slot = AddrLayout::tag(pa, level);
+            if (level == LEVELS - 1) { // 叶子节点更新
+                node.remapped_id = remapped_block;
+                break;
+            }// 检查当前槽位是否已分配
+            if (!check_bit(node.allocated_bits, slot)) {
+				// 动态分配子节点（若是最后一层的前一层，则为叶子节点）
+                const bool is_leaf = (level == LEVELS - 2);
+                const uint32_t child_idx = allocate_node(is_leaf);
+				// 更新位图和子节点索引
+                set_bit(node.allocated_bits, slot);
+                node.child_indices[slot] = child_idx;
+
+                // 预填充叶子节点的初始值（避免后续查找失败）
+                if (is_leaf) {
+                    node_pool_[child_idx].remapped_id = remapped_block;
+                }
+            }
+			// 跳转到子节点继续处理
+            current_idx = node.child_indices[slot];
+        }
+    }
+
+private:
+    uint32_t allocate_node(bool is_leaf) {
+        node_pool_.emplace_back(is_leaf);
+        return node_pool_.size() - 1;
+    }
+
+    static bool check_bit(const uint32_t* bits, uint32_t pos) {
+        return (bits[pos >> 5] >> (pos & 0x1F)) & 0x1;
+    }
+
+    static void set_bit(uint32_t* bits, uint32_t pos) {
+        bits[pos >> 5] |= (1 << (pos & 0x1F));
+    }
 };
+// class iRT
+// {
+// public:
+// 	struct iRNode{
+// 		bool is_leaf;
+// 		union{
+// 			BitVector* allocated_bits; // 中间节点仅使用2048位向量（bit vector）来表示下一层是否已分配
+// 			BlockID remapped_id; // 仅叶子节点存储重映射块 ID
+// 		};
+// 	};
 
-/**
- * @brief 一个Set对应的SDTree;
- * @author Jiahao Lu @ XMU
- */
-class SDTree
-{
-public:
-	bool full_bit; // 指示是否全满
-	g_vector<uint16_t> path_bit_array; // 指示path选择 (0上次走右子树，1上次走左子树)
-	g_vector<SDLNode> sdnodes; // 叶子节点的集合
-	uint16_t tree_height; // 树高（便于树的计算）
+// 	static constexpr uint32_t BITS_PER_LEVEL = 11;   // 每层11位
+// 	static constexpr uint32_t CHILDREN_PER_NODE = 1 << BITS_PER_LEVEL; // 2048
+// 	static constexpr uint32_t LEVELS = 2;             // 两级结构
+
+// 	struct AddrLayout {
+// 		// 48位地址划分
+// 		static constexpr uint32_t OFFSET_BITS = 8;    // 256B块偏移
+// 		static constexpr uint32_t LEVEL_BITS  = 11;   // 每级11位
+// 		static constexpr uint32_t LEVELS       = 2;    // 两级结构
+// 		static constexpr uint32_t SET_BITS     = 11;   // 2048个集合
+		
+// 		// 地址解码（从高位到低位：SET|TAG_LEVEL0|TAG_LEVEL1|OFFSET）
+// 		static uint32_t set(PhysicalAddr pa) { 
+// 			return (pa >> (LEVEL_BITS*LEVELS + OFFSET_BITS)) & ((1<<SET_BITS)-1);
+// 		}
+		
+// 		static uint32_t tag(PhysicalAddr pa, int level) {
+// 			const uint32_t shift = OFFSET_BITS + (LEVELS-level-1)*LEVEL_BITS;
+// 			return (pa >> shift) & ((1 << LEVEL_BITS)-1);
+// 		}
+// 	};
+
+// 	g_vector<iRNode> node_pool_;
+// 	g_vector<uint32_t> tag_roots_; // 根节点索引
+// 	static constexpr uint32_t INVALID_INDEX = ~0u;
 	
+//  	iRT(int sets) : tag_roots_(sets, INVALID_INDEX) {
+//         // 预分配根节点（每个set一个）
+//         for(auto& root : tag_roots_) {
+//             root = allocate_node(false); // 中间节点
+//         }
+//     }
 
-	/**
-	 * @brief 路径的选择；根节点开始检查，根据0/1，指示下一层选择的节点；
-	 * 		  当前层为`i`,则左子节点为`2i+1`,右子节点`2i+2`
-	 * 		  vector path表示路径包含的节点信息。
-	 * 		  返回的是叶子节点索引
-	 */
-	int path_select()
-	{
-		int cur_node = 0;
-		uint16_t times = tree_height - 1;
-		g_vector<int> path;
-		path.push_back(cur_node);
-		while(times)
-		{
-			times -= 1;
-			if(path_bit_array[cur_node] == 0)
-			{
-				cur_node = 2 * cur_node + 1;
-				path.push_back(cur_node);
-			}
-			else
-			{
-				cur_node = 2 * cur_node + 2;
-				path.push_back(cur_node);
-			}
-		}
+// 	/**
+// 	 * @brief 根据物理地址进行多级查找。首先提取set_index，如果超出范围则返回恒等映射。
+// 	 * 		  然后获取根节点的current_idx，如果是无效的，直接返回。
+// 	 * 		  然后循环遍历LEVEL_SIZES的层级数减一，因为最后一级是叶节点。
+// 	 * 		  在每个层级，检查节点是否是叶节点（可能提前终止循环），然后提取当前层级的slot。
+// 	 * 		  检查该slot是否已经分配，如果没有，返回恒等映射;
+// 	 * 		  否则计算子节点索引并继续查找。最后处理叶节点，合成设备地址。
+// 	 * @example pa=0x12345678： 
+// 	 * 		【假设如下】
+// 	 * 			| 11-bit Set | 5-bit Level0 | 5-bit Level1 | 8-bit Block Offset |
+// 	 * 			| (0x3FF)    | (0x1F)       | (0x1F)       | (0xFF)             |
+// 	 * 			 0001 0010 0011 0100 0101 0110 0111 1000
+// 	 * 			| 0001 0010 001 | 1 0100 | 0 1011 | ... | 0111 1000 |
+// 	 * 		【提取流程】
+// 	 * 			set_idx = 0001 0010 001 → 0x113
+// 	 * 			→ tag_roots_[0x113]
+// 	 * 			Level-0:1 0100 → 0x14
+// 	 * 			Level-1:0 1011 → 0x0B
+// 	 * 
+// 	 */
+// 	DeviceAddr translate(PhysicalAddr pa) const 
+// 	{
+// 		const uint32_t set_idx = AddrLayout::set(pa);
+// 		if(set_idx >= tag_roots_.size()) return pa; // 集合范围检查
+		
+// 		// 获取当前集合的根节点
+// 		uint32_t current_idx = tag_roots_[set_idx];
+// 		if(current_idx == INVALID_INDEX) return pa;
+		
+// 		// 遍历中间层级
+// 		for(uint32_t level = 0; level < AddrLayout::LEVELS; ++level) {
+// 			if(current_idx >= node_pool_.size()) return pa;
+			
+// 			const auto& node = node_pool_[current_idx];
+// 			if(node.is_leaf) break; // 提前到达叶节点
+			
+// 			// 计算当前层级的slot索引
+// 			const uint32_t slot = AddrLayout::tag(pa, level);
+// 			if(!check_bit(node.allocated_bits, slot)) 
+// 				return pa; // 未分配则返回恒等映射
+				
+// 			// 计算子节点索引（假设每个bitvec单元存储32个子节点指针）
+// 			const uint32_t vec_index = slot / 32;
+// 			const uint32_t bit_offset = slot % 32;
+// 			current_idx = (node.allocated_bits[vec_index] >> bit_offset) & 0xFFFF; // 16-bit子节点索引
+// 		}
+		
+// 		// 处理叶节点
+// 		const auto& leaf = node_pool_[current_idx];
+// 		return leaf.is_leaf ? 
+// 			(leaf.remapped_id << AddrLayout::OFFSET_BITS) | (pa & ((1<<AddrLayout::OFFSET_BITS)-1))
+// 			: pa;
+// 	}
 
-		// Example node_idx = 3  lnode_idx = 3 + 1 - 2^(2) = 0
-		int lnode_idx = path[tree_height-1] + 1 - (int)(pow(2,tree_height-1)+0.5); 
-		return lnode_idx;
-	}
+// 	void update(PhysicalAddr pa, DeviceAddr da) {  // 修改参数列表
+// 		const uint32_t set_idx = AddrLayout::set(pa);
+// 		if(set_idx >= tag_roots_.size()) return;
 
-	/**
-	 * @brief 更新是否为满（代码上写需要二重循环，硬件实现的话只需要way/电路并行度个cycles）
-	 */
-	void updFullState()
-	{
-		full_bit = 1;
-		for(int i = 0; i < (int)(pow(2,tree_height-1)+0.5);i++)
-		{
-			for(int j = 0; j < 4; j++)
-			{
-				if(sdnodes[i].empty_array[j]==1)
-				{
-					full_bit = 0;
-					break;
-				}
-			}
-		}
-	}
+// 		const BlockID remapped_block = da >> AddrLayout::OFFSET_BITS; // 从da解析块ID
+// 		uint32_t current_idx = tag_roots_[set_idx];
+// 		g_vector<uint32_t*> modified_bits;
+// 		for(int level = 0; level < LEVELS; ++level)
+// 		{
+// 			const uint32_t slot = AddrLayout::tag(pa, level);
+// 			iRNode& node = node_pool_[current_idx];
+				
+// 			if(level == LEVELS-1) 
+// 			{ // 叶节点直接更新
+// 				node.remapped_id = remapped_block;
+// 				break;
+// 			}
 
-	/**
-	 * @brief 返回pair，first表示对应叶子节点索引，second表示叶子节点对应的way的index;
-	 *  	  代码实现是二重循环，但是硬件实现的话只需要way/电路并行度个cycles;
-	 * 		  只是找到empty way，不会更新full_bit
-	 */
-	std::pair<int,int> findEmptyWay()
-	{
-		std::pair<int,int> pij;
-		pij = std::make_pair(-1,-1);
-		updFullState();
-		if(!full_bit)
-		{
-			for(int i = 0; i < (int)(pow(2,tree_height-1)+0.5);i++)
-			{
-				for(int j = 0; j < 4;j++)
-				{
-					if(sdnodes[i].empty_array[j]==true)
-					{
-						pij = std::make_pair(i,j); 
-						break;
-					}
-				}
-			}
-		}
-		return pij;
-	}
+// 				// 中间节点操作（无需动态分配）
+// 			if(!check_bit(node.allocated_bits, slot)) 
+// 			{
+// 				const uint32_t child_idx = allocate_node(level == LEVELS-2);
+// 				set_bit(node.allocated_bits, slot);
+// 				node.child_indices[slot] = child_idx;
+// 			}
+				
+// 			current_idx = node.child_indices[slot];
+// 		}
+// 	}
+// private:
+//     /**
+// 	 * @brief 检查第`pos`个节点是否已经分配
+// 	 */
+//     bool check_bit(uint32_t* bits, uint32_t pos) const {
+//         return (bits[pos >> 5] >> (pos& 0x1F)) & 0x1; // <=> (bits[pos/32] >> (pos%32))  & 0x1
+//     }
+    
+//     /**
+// 	 * @brief 节点分配
+// 	 */
+//     uint32_t allocate_node(bool is_leaf) 
+// 	{
+// 		constexpr uint32_t BITVEC_SIZE = CHILDREN_PER_NODE/32;
+		
+// 		iRNode node;
+// 		node.is_leaf = is_leaf;
+// 		if(!is_leaf) {
+// 			// 使用对齐分配（64字节对齐）
+// 			node.allocated_bits = static_cast<uint32_t*>(
+// 				aligned_alloc(64, BITVEC_SIZE*sizeof(uint32_t))
+// 			);
+// 			memset(node.allocated_bits, 0, BITVEC_SIZE*sizeof(uint32_t));
+// 		}
+		
+// 		node_pool_.push_back(node);
+// 		return node_pool_.size()-1;
+// 	}
 
-	/**
-	 * @brief 根据替换/访问叶子节点索引，更新根节点和中间节点的path bit
-	 */
-	void updNodePathBit(int lnode_idx)
-	{
-		int rev_idx = (int)(pow(2,tree_height-1)+0.5) - 1 + lnode_idx;
-		g_vector<int> rev_path;
-		int current_index = rev_idx;
-		rev_path.push_back(rev_idx);
-
-		while(current_index > 0)
-		{
-			int parent_idx = (current_index - 1) / 2;
-			rev_path.push_back(parent_idx);
-			bool left = current_index == 2 * parent_idx + 1;
-			if(left)path_bit_array[parent_idx] = 1; // 本次走左子树，故更新为1
-			else path_bit_array[parent_idx] = 0; // 本次走右子树，故更新为0
-			current_index = parent_idx;
-		}
-	};
-};
-
-
+// 	// 设置bit vector中的对应slot为子节点索引
+//     void set_bit(uint32_t* bits, uint32_t slot, uint32_t child_idx) {
+//         const uint32_t word = slot / 32;
+//         const uint32_t offset = slot % 32;
+//         bits[word] |= (1 << offset);       // Mark as allocated
+//         // 假设child_idx低11位存储子节点位置（需根据实际布局调整）
+//         bits[word] |= (child_idx << 11);   // 根据实际存储结构调整
+//     }
+    
+//     // 获取子节点在pool中的索引
+//     uint32_t get_child_index(const iRNode& node, uint32_t slot) const {
+//         const uint32_t word = slot / 32;
+//         const uint32_t offset = slot % 32;
+//         return (node.allocated_bits[word] >> 11) & 0x7FF; // 提取11位索引
+//     }
+// };
 
 class Way
 {
@@ -687,7 +749,7 @@ public:
 	uint32_t _fm_size;
 	uint32_t _set_assoc;
 	g_vector<SDTree> sdtrees;
-
+	
 
 	// Trimma
 	uint32_t block_size; // paper default 256GB
@@ -695,6 +757,10 @@ public:
 	uint32_t irt_levels; // default 3
 	NonIdCache nonIdCache;
 	IdCache idCache;
+
+	iRT _iRT;
+	IdCache _idCache;
+	NonIdCache _nonIdCache;
 
 	// <set_id,tag,way>
 	struct Triplet {
